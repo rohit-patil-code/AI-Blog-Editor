@@ -1,236 +1,185 @@
-const OpenAI = require('openai');
+// ...existing code...
+const { GoogleGenAI } = require('@google/genai');
 const logger = require('../utils/logger');
+require('dotenv').config();
 
 class AIService {
   constructor() {
-    if (!process.env.OPENAI_API_KEY) {
-      logger.warn('⚠️ OPENAI_API_KEY not found in environment variables');
+    // Accept GENAI_API_KEY or GEMINI_API_KEY for compatibility
+    this.apiKey = process.env.GENAI_API_KEY || process.env.GEMINI_API_KEY || null;
+
+    // Initialize client. The constructor accepts an options object but can also
+    // rely on environment-based credentials depending on your setup.
+    try {
+      this.client = new GoogleGenAI(this.apiKey ? { apiKey: this.apiKey } : {});
+      logger.info('✅ Gemini/GenAI client initialized successfully');
+    } catch (err) {
       this.client = null;
-    } else {
-      this.client = new OpenAI({
-        apiKey: process.env.OPENAI_API_KEY
+      logger.warn('⚠️ Failed to initialize GoogleGenAI client:', err?.message || err);
+    }
+
+    // Models: primary from env, fallback to a safe text-bison
+    this.defaultModel = process.env.GENAI_MODEL || process.env.GEMINI_MODEL || 'gemini-flash-latest';
+    this.fallbackModel = process.env.GENAI_FALLBACK_MODEL || process.env.GEMINI_FALLBACK_MODEL || 'text-bison-001';
+  }
+
+  // low-level call wrapper using the same shape you requested:
+  // const response = await ai.models.generateContent({ model, contents });
+  async _callModel(model, contents, { temperature = 0.7, maxOutputTokens = 600 } = {}) {
+    if (!this.client) {
+      const e = new Error('Generative client not configured (set GENAI_API_KEY or GEMINI_API_KEY)');
+      e.status = 503;
+      throw e;
+    }
+
+    try {
+      const res = await this.client.models.generateContent({
+        model,
+        contents,
+        temperature,
+        maxOutputTokens
       });
-      logger.info('✅ OpenAI client initialized successfully');
+
+      // sample client returns object with .text or .output; prefer .text
+      const text = res?.text ?? res?.response?.text ?? (Array.isArray(res?.output) ? res.output[0]?.content : undefined) ?? '';
+
+      // tokens used if available (metadata shape varies)
+      const tokensUsed = Number(res?.metadata?.tokenCount ?? res?.usage?.totalTokens ?? res?.usage?.total_tokens ?? 0) || 0;
+
+      return { text: String(text), tokensUsed, raw: res };
+    } catch (err) {
+      // Normalize known errors
+      const status = err?.status || err?.code || (err?.message && err.message.includes('quota') ? 429 : undefined);
+      const e = new Error(err?.message || 'Generative API error');
+      e.status = status || 500;
+      e.raw = err;
+      throw e;
     }
   }
 
-  // Generate content based on prompt
+  // Public: generateContent(prompt, options)
   async generateContent(prompt, options = {}) {
-    if (!this.client) {
-      throw new Error('OpenAI API key not configured. Please add OPENAI_API_KEY to your .env file.');
-    }
-    
+    const { creativity = options.creativity ?? 0.7, length = options.length ?? 'medium', tone = options.tone ?? 'professional' } = options;
+
+    const systemPrompt = this.getSystemPrompt(tone, length);
+    const finalPrompt = `${systemPrompt}\n\n${prompt}`;
+
+    const maxOutputTokens = this.getMaxTokens(length);
+
+    // Try primary model then fallback
     try {
-      const {
-        tone = 'professional',
-        length = 'medium',
-        creativity = 0.7
-      } = options;
-
-      const systemPrompt = this.getSystemPrompt(tone, length);
-      const maxTokens = this.getMaxTokens(length);
-
-      const response = await this.client.chat.completions.create({
-        model: 'gpt-4',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: prompt }
-        ],
-        temperature: creativity,
-        max_tokens: maxTokens
-      });
-
-      const content = response.choices[0].message.content;
-      const tokensUsed = response.usage.total_tokens;
-
-      logger.info('Content generated', { 
-        promptLength: prompt.length, 
-        tokensUsed, 
-        contentLength: content.length 
-      });
-
-      return {
-        content,
-        tokensUsed,
-        timestamp: new Date().toISOString()
-      };
-    } catch (error) {
-      logger.error('Content generation error:', error);
-      throw new Error('Failed to generate content');
+      const resp = await this._callModel(this.defaultModel, finalPrompt, { temperature: creativity, maxOutputTokens });
+      logger.info('Content generated', { model: this.defaultModel, tokensUsed: resp.tokensUsed });
+      return { content: resp.text, tokensUsed: resp.tokensUsed, model: this.defaultModel, timestamp: new Date().toISOString() };
+    } catch (err) {
+      logger.warn(`Primary model ${this.defaultModel} failed: ${err.message}`);
+      // If model-not-found / 404 or failure, try fallback
+      try {
+        const resp2 = await this._callModel(this.fallbackModel, finalPrompt, { temperature: creativity, maxOutputTokens });
+        logger.info('Content generated (fallback)', { model: this.fallbackModel, tokensUsed: resp2.tokensUsed });
+        return { content: resp2.text, tokensUsed: resp2.tokensUsed, model: this.fallbackModel, timestamp: new Date().toISOString() };
+      } catch (err2) {
+        logger.error('Generative content error (fallback):', err2);
+        const e = new Error('Failed to generate content (Gemini/GenAI)');
+        e.status = err2.status || 500;
+        throw e;
+      }
     }
   }
 
-  // Correct grammar and style
+  // Grammar correction
   async correctGrammar(text) {
-    if (!this.client) {
-      throw new Error('OpenAI API key not configured. Please add OPENAI_API_KEY to your .env file.');
-    }
-    
+    const instruction = `You are a professional grammar and style editor. Correct grammar, punctuation, and style issues. Return JSON only: {"correctedText":"...", "changes":[{ "original":"...", "corrected":"...", "reason":"..." }]}\n\nText:\n${text}`;
     try {
-      const response = await this.client.chat.completions.create({
-        model: 'gpt-4',
-        messages: [
-          {
-            role: 'system',
-            content: `You are a professional grammar and style editor. Correct any grammar, spelling, punctuation, and style issues in the provided text. Return the corrected text and a list of changes made. Format your response as JSON with "correctedText" and "changes" fields. The changes should include the original text, corrected text, position, and reason for each change.`
-          },
-          {
-            role: 'user',
-            content: `Please correct the grammar and style in this text:\n\n${text}`
-          }
-        ],
-        temperature: 0.3,
-        max_tokens: 1000
-      });
-
-      const result = JSON.parse(response.choices[0].message.content);
-      const tokensUsed = response.usage.total_tokens;
-
-      logger.info('Grammar corrected', { 
-        textLength: text.length, 
-        tokensUsed, 
-        changesCount: result.changes?.length || 0 
-      });
-
-      return {
-        correctedText: result.correctedText,
-        changes: result.changes || [],
-        tokensUsed,
-        timestamp: new Date().toISOString()
-      };
-    } catch (error) {
-      logger.error('Grammar correction error:', error);
-      throw new Error('Failed to correct grammar');
+      const resp = await this._callModel(this.defaultModel, instruction, { temperature: 0.2, maxOutputTokens: 800 });
+      let parsed;
+      try { parsed = JSON.parse(resp.text); } catch { parsed = null; }
+      if (parsed && parsed.correctedText) {
+        return { correctedText: parsed.correctedText, changes: parsed.changes || [], tokensUsed: resp.tokensUsed, timestamp: new Date().toISOString() };
+      }
+      // fallback: return whole text as correctedText
+      return { correctedText: resp.text, changes: [], tokensUsed: resp.tokensUsed, timestamp: new Date().toISOString() };
+    } catch (err) {
+      logger.error('Grammar correction error:', err);
+      throw err;
     }
   }
 
-  // Enhance content (expand, simplify, improve, summarize)
+  // Enhance content
   async enhanceContent(text, type) {
-    if (!this.client) {
-      throw new Error('OpenAI API key not configured. Please add OPENAI_API_KEY to your .env file.');
+    let prompt;
+    switch (type) {
+      case 'expand':
+        prompt = `Expand the following text with more detail and examples while preserving meaning:\n\n${text}`;
+        break;
+      case 'simplify':
+        prompt = `Simplify the following text for a general audience while preserving the key points:\n\n${text}`;
+        break;
+      case 'improve':
+        prompt = `Improve clarity, flow, and impact of the following text:\n\n${text}`;
+        break;
+      case 'summarize':
+        prompt = `Summarize the following text concisely:\n\n${text}`;
+        break;
+      default:
+        prompt = text;
     }
-    
+
     try {
-      const prompts = {
-        expand: `Expand the following text to provide more detail, examples, and context while maintaining the original meaning and tone:\n\n${text}`,
-        simplify: `Simplify the following text to make it more accessible and easier to understand while keeping the key information:\n\n${text}`,
-        improve: `Improve the following text by enhancing clarity, flow, and impact while maintaining the original meaning:\n\n${text}`,
-        summarize: `Summarize the following text into a concise version that captures the main points:\n\n${text}`
-      };
-
-      const systemPrompts = {
-        expand: 'You are a content writer who excels at expanding ideas with relevant details and examples.',
-        simplify: 'You are a technical writer who specializes in making complex content accessible to all audiences.',
-        improve: 'You are a professional editor who enhances content for better readability and impact.',
-        summarize: 'You are a skilled summarizer who can distill content to its essential points.'
-      };
-
-      const response = await this.client.chat.completions.create({
-        model: 'gpt-4',
-        messages: [
-          { role: 'system', content: systemPrompts[type] },
-          { role: 'user', content: prompts[type] }
-        ],
-        temperature: 0.7,
-        max_tokens: 1500
-      });
-
-      const enhancedText = response.choices[0].message.content;
-      const tokensUsed = response.usage.total_tokens;
-
-      logger.info('Content enhanced', { 
-        type, 
-        textLength: text.length, 
-        tokensUsed, 
-        enhancedLength: enhancedText.length 
-      });
-
-      return {
-        enhancedText,
-        tokensUsed,
-        timestamp: new Date().toISOString()
-      };
-    } catch (error) {
-      logger.error('Content enhancement error:', error);
-      throw new Error('Failed to enhance content');
+      const resp = await this._callModel(this.defaultModel, prompt, { temperature: 0.6, maxOutputTokens: 900 });
+      return { enhancedText: resp.text, tokensUsed: resp.tokensUsed, timestamp: new Date().toISOString() };
+    } catch (err) {
+      // try fallback
+      try {
+        const resp2 = await this._callModel(this.fallbackModel, prompt, { temperature: 0.6, maxOutputTokens: 900 });
+        return { enhancedText: resp2.text, tokensUsed: resp2.tokensUsed, timestamp: new Date().toISOString() };
+      } catch (err2) {
+        logger.error('Enhance content error:', err2);
+        throw err2;
+      }
     }
   }
 
-  // Generate title suggestions
+  // Generate titles
   async generateTitles(content, count = 5) {
-    if (!this.client) {
-      throw new Error('OpenAI API key not configured. Please add OPENAI_API_KEY to your .env file.');
-    }
-    
+    const prompt = `Generate ${count} SEO-friendly titles (one per line) for the content below. Return plain text, one title per line.\n\n${content}`;
     try {
-      const response = await this.client.chat.completions.create({
-        model: 'gpt-4',
-        messages: [
-          {
-            role: 'system',
-            content: `You are a professional content strategist who creates compelling, SEO-friendly titles. Generate ${count} different title options for the given content. Return only the titles, one per line, without numbering or bullet points.`
-          },
-          {
-            role: 'user',
-            content: `Generate ${count} title suggestions for this content:\n\n${content}`
-          }
-        ],
-        temperature: 0.8,
-        max_tokens: 500
-      });
-
-      const titles = response.choices[0].message.content
-        .split('\n')
-        .map(title => title.trim())
-        .filter(title => title.length > 0)
-        .slice(0, count);
-
-      const tokensUsed = response.usage.total_tokens;
-
-      logger.info('Titles generated', { 
-        contentLength: content.length, 
-        tokensUsed, 
-        titlesCount: titles.length 
-      });
-
-      return {
-        titles,
-        tokensUsed,
-        timestamp: new Date().toISOString()
-      };
-    } catch (error) {
-      logger.error('Title generation error:', error);
-      throw new Error('Failed to generate titles');
+      const resp = await this._callModel(this.defaultModel, prompt, { temperature: 0.8, maxOutputTokens: 300 });
+      const lines = resp.text.split('\n').map(l => l.trim()).filter(Boolean).slice(0, count);
+      return { titles: lines, tokensUsed: resp.tokensUsed, timestamp: new Date().toISOString() };
+    } catch (err) {
+      try {
+        const resp2 = await this._callModel(this.fallbackModel, prompt, { temperature: 0.8, maxOutputTokens: 300 });
+        const lines2 = resp2.text.split('\n').map(l => l.trim()).filter(Boolean).slice(0, count);
+        return { titles: lines2, tokensUsed: resp2.tokensUsed, timestamp: new Date().toISOString() };
+      } catch (err2) {
+        logger.error('Title generation error:', err2);
+        throw err2;
+      }
     }
   }
 
-  // Get system prompt based on tone and length
+  // Helpers for prompts/tokens
   getSystemPrompt(tone, length) {
-    const toneInstructions = {
-      professional: 'Write in a professional, formal tone suitable for business and academic contexts.',
-      casual: 'Write in a friendly, conversational tone that feels approachable and engaging.',
-      technical: 'Write in a precise, technical tone with clear explanations and terminology.',
-      creative: 'Write in an imaginative, expressive tone that captivates and inspires readers.'
+    const toneMap = {
+      professional: 'Write in a formal, informative tone.',
+      casual: 'Write in a friendly, conversational tone.',
+      technical: 'Write in a precise, technical tone with clear explanations.',
+      creative: 'Write in an imaginative, expressive tone.'
     };
-
-    const lengthInstructions = {
-      short: 'Keep the response concise and to the point (100-200 words).',
-      medium: 'Provide a balanced response with good detail (300-500 words).',
-      long: 'Create a comprehensive, detailed response (600-1000 words).'
+    const lengthMap = {
+      short: 'Keep it concise (~100 words).',
+      medium: 'Balanced detail (~300 words).',
+      long: 'Comprehensive (~600-1000 words).'
     };
-
-    return `You are an expert content writer. ${toneInstructions[tone]} ${lengthInstructions[length]} Focus on creating high-quality, engaging content that provides value to readers.`;
+    return `You are an expert content writer. ${toneMap[tone] || ''} ${lengthMap[length] || ''}`;
   }
 
-  // Get max tokens based on length
   getMaxTokens(length) {
-    const tokenLimits = {
-      short: 300,
-      medium: 600,
-      long: 1200
-    };
-    return tokenLimits[length] || 600;
+    const limits = { short: 300, medium: 600, long: 1200 };
+    return limits[length] || 600;
   }
 }
 
 module.exports = new AIService();
+// ...existing code...
