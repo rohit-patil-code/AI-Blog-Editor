@@ -87,18 +87,34 @@ class AIService {
     }
   }
 
-  // Grammar correction
+  // Grammar correction - ask model to return corrected text only
   async correctGrammar(text) {
-    const instruction = `You are a professional grammar and style editor. Correct grammar, punctuation, and style issues. Return JSON only: {"correctedText":"...", "changes":[{ "original":"...", "corrected":"...", "reason":"..." }]}\n\nText:\n${text}`;
+    if (!text || !text.trim()) {
+      return {
+        correctedText: '',
+        changes: [],
+        tokensUsed: 0,
+        timestamp: new Date().toISOString(),
+      };
+    }
+
+    // Instruct model to return only the corrected text and nothing else.
+    const prompt = `You are a professional grammar and style editor. Correct grammar, spelling, punctuation and minor stylistic issues while preserving the original meaning and tone. RETURN ONLY THE CORRECTED TEXT AND NOTHING ELSE (no explanations, no JSON, no metadata).\n\nText:\n${text}`;
+
     try {
-      const resp = await this._callModel(this.defaultModel, instruction, { temperature: 0.2, maxOutputTokens: 800 });
-      let parsed;
-      try { parsed = JSON.parse(resp.text); } catch { parsed = null; }
-      if (parsed && parsed.correctedText) {
-        return { correctedText: parsed.correctedText, changes: parsed.changes || [], tokensUsed: resp.tokensUsed, timestamp: new Date().toISOString() };
-      }
-      // fallback: return whole text as correctedText
-      return { correctedText: resp.text, changes: [], tokensUsed: resp.tokensUsed, timestamp: new Date().toISOString() };
+      const resp = await this._callModel(this.defaultModel, prompt, {
+        temperature: 0.0,
+        maxOutputTokens: Math.min(1200, Math.max(300, Math.ceil(text.length / 2))),
+      });
+
+      const correctedText = (resp.text || '').trim();
+
+      return {
+        correctedText,
+        changes: [], // caller requested corrected text only
+        tokensUsed: resp.tokensUsed || 0,
+        timestamp: new Date().toISOString(),
+      };
     } catch (err) {
       logger.error('Grammar correction error:', err);
       throw err;
