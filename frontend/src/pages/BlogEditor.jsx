@@ -105,7 +105,7 @@ export function BlogEditor() {
             tone: data.tone || 'professional',
             length: data.length || 'medium'
           })
-          setPost({ ...post, content: post.content + result.data.content })
+          setPost({ ...post, content: result.data.content })
           break
         case 'grammar':
           if (!selectedText) return toast.error('Select text to correct')
@@ -242,7 +242,7 @@ export function BlogEditor() {
           <button
             onClick={() =>
               handleAIAction('generate', {
-                prompt: 'Write an engaging introduction for a blog post about...',
+                prompt: `Write an engaging introduction for a blog post on title: ${post.title}`,
               })
             }
             disabled={aiLoading}
